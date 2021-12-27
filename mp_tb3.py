@@ -10,17 +10,95 @@ from collections import deque
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
-from numpy.core.numeric import True_
 
 import wx
-from pynput.mouse import Button, Controller as mController
-from pynput.keyboard import Key, Controller as kController
 
+from pynput.mouse import Button, Controller as mController
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
 from utils import firstLRF #导入必要的类
 from utils import func_result
 
+import rospy #ROS 机器人部分
+from geometry_msgs.msg import Twist
+import sys, select, os
+if os.name == 'nt':
+  import msvcrt
+else:
+  import tty, termios
+
+BURGER_MAX_LIN_VEL = 0.22 #数据
+BURGER_MAX_ANG_VEL = 2.84
+
+WAFFLE_MAX_LIN_VEL = 0.26
+WAFFLE_MAX_ANG_VEL = 1.82
+
+LIN_VEL_STEP_SIZE = 0.01
+ANG_VEL_STEP_SIZE = 0.1
+
+e = """
+Communications Failed
+"""
+
+def getKey():
+    if os.name == 'nt':
+      if sys.version_info[0] >= 3:
+        return msvcrt.getch().decode()
+      else:
+        return msvcrt.getch()
+
+    tty.setraw(sys.stdin.fileno())
+    rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+    if rlist:
+        key = sys.stdin.read(1)
+    else:
+        key = ''
+
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+    return key
+
+def vels(target_linear_vel, target_angular_vel):
+    return "currently:\tlinear vel %s\t angular vel %s " % (target_linear_vel,target_angular_vel)
+
+def makeSimpleProfile(output, input, slop):
+    if input > output:
+        output = min( input, output + slop )
+    elif input < output:
+        output = max( input, output - slop )
+    else:
+        output = input
+
+    return output
+
+def constrain(input, low, high):
+    if input < low:
+      input = low
+    elif input > high:
+      input = high
+    else:
+      input = input
+
+    return input
+
+def checkLinearLimitVelocity(vel):
+    if turtlebot3_model == "burger":
+      vel = constrain(vel, -BURGER_MAX_LIN_VEL, BURGER_MAX_LIN_VEL)
+    elif turtlebot3_model == "waffle" or turtlebot3_model == "waffle_pi":
+      vel = constrain(vel, -WAFFLE_MAX_LIN_VEL, WAFFLE_MAX_LIN_VEL)
+    else:
+      vel = constrain(vel, -BURGER_MAX_LIN_VEL, BURGER_MAX_LIN_VEL)
+
+    return vel
+
+def checkAngularLimitVelocity(vel):
+    if turtlebot3_model == "burger":
+      vel = constrain(vel, -BURGER_MAX_ANG_VEL, BURGER_MAX_ANG_VEL)
+    elif turtlebot3_model == "waffle" or turtlebot3_model == "waffle_pi":
+      vel = constrain(vel, -WAFFLE_MAX_ANG_VEL, WAFFLE_MAX_ANG_VEL)
+    else:
+      vel = constrain(vel, -BURGER_MAX_ANG_VEL, BURGER_MAX_ANG_VEL)
+
+    return vel
  
                 
 def get_args():
@@ -69,9 +147,26 @@ right_button_flag=False
 func_string="Unknow"
 func_work_status_flag=0
 fwsf_history=deque(maxlen=8) #fwsf=func_work_status_flag
-work_mode=1 #工作模式 0：基础 1：PPT 10：选择模式 2:结合人脸识别
+work_mode=0 #工作模式 0：基础 1：PPT 10：选择模式
+
+# ROS 变量
+status = 0
+target_linear_vel   = 0.0
+target_angular_vel  = 0.0
+control_linear_vel  = 0.0
+control_angular_vel = 0.0
 
 def main():
+
+    #ROS 参数 初始化
+    if os.name != 'nt': 
+        settings = termios.tcgetattr(sys.stdin)
+
+    rospy.init_node('turtlebot3_teleop')
+    pub = rospy.Publisher('cmd_vel', Twist, queue_size=10)
+
+    turtlebot3_model = rospy.get_param("model", "waffle")
+
     # 参数解析 #################################################################
     args = get_args()
 
@@ -91,7 +186,11 @@ def main():
     global func_string
     global work_mode
     use_brect = True
-    keyboard=kController()
+    global statue
+    global target_angular_vel
+    global target_linear_vel
+    global control_angular_vel
+    global control_linear_vel
 
     # 准备相机 ###############################################################
     cap = cv.VideoCapture(cap_device)
@@ -106,11 +205,6 @@ def main():
         max_num_hands=hands_max_num, #TODO
         min_detection_confidence=min_detection_confidence,
         min_tracking_confidence=min_tracking_confidence,
-    )
-
-    mp_face_detection = mp.solutions.face_detection  #脸部识别
-    face_detection = mp_face_detection.FaceDetection(
-        min_detection_confidence=0.6
     )
 
     mp_drawing = mp.solutions.drawing_utils #画笔
@@ -204,412 +298,277 @@ def main():
     #  ########################################################################
     logMode = 0
 
-    while True:
-        # fps = cvFpsCalc.get()
+    try:
+        while True:
+            # fps = cvFpsCalc.get()
 
-        # 按键处理（ESC：退出） #################################################
-        key = cv.waitKey(10)
-        if key == 27:  # ESC
-            break
-        logNumber, logMode = select_mode(key, logMode)
+            # 按键处理（ESC：退出） #################################################
+            key = cv.waitKey(10)
+            if key == 27:  # ESC
+                break
+            logNumber, logMode = select_mode(key, logMode)
 
-        # 获取摄像机内容 #####################################################
-        ret, image = cap.read()
-        if not ret:
-            break
+            # 获取摄像机内容 #####################################################
+            ret, image = cap.read()
+            if not ret:
+                break
 
-        image = cv.flip(image, 1)  # 镜像显示
-        debug_image = copy.deepcopy(image)
+            image = cv.flip(image, 1)  # 镜像显示
+            debug_image = copy.deepcopy(image)
 
-        
-        image_width,image_height=image.shape[1],image.shape[0]
-
-        # 检测手部信息 #############################################################
-        image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
-        # 可以通过修改image的范围大小限定只识别这个区域内的手 待完善
-
-        image.flags.writeable = False
-
-        if (work_mode==2):
-            face_results=face_detection.process(image)
-            if face_results.detections is not None:
-                for face in face_results.detections:
-                    location_data=face.location_data
-                    rBB=location_data.relative_bounding_box
-                    
-                    face_size=calc_face_image(rBB,image_width,image_height)
-                    
-            hand_results = hands.process(image)
             
-        else:
+            image_width,image_height=image.shape[1],image.shape[0]
+
+            # 检测手部信息 #############################################################
+            image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+            # 可以通过修改image的范围大小限定只识别这个区域内的手 待完善
+
+            image.flags.writeable = False
+                
             hand_results = hands.process(image)
-        image.flags.writeable = True
+            image.flags.writeable = True
 
-        func_work_status_flag=0
+            func_work_status_flag=0
 
-        if (work_mode==2):
-            if face_results.detections is not None:
-                for face in face_results.detections:
-                    mp_drawing.draw_detection(debug_image, face)
+            #  ####################################################################
+            if hand_results.multi_hand_landmarks is not None:
+                for hand_landmarks, handedness,i in zip(hand_results.multi_hand_landmarks,
+                                                    hand_results.multi_handedness,
+                                                    range(len(hand_results.multi_hand_landmarks))):
+                    # 计算手的外接矩形
+                    brect = calc_bounding_rect(debug_image, hand_landmarks)
 
-        #  ####################################################################
-        if hand_results.multi_hand_landmarks is not None:
-            for hand_landmarks, handedness,i in zip(hand_results.multi_hand_landmarks,
-                                                  hand_results.multi_handedness,
-                                                  range(len(hand_results.multi_hand_landmarks))):
-                # 计算手的外接矩形
-                brect = calc_bounding_rect(debug_image, hand_landmarks)
+                    if(len(hand_results.multi_hand_landmarks)==2 and i==0): #预先计算出两个矩形的重叠面积占比 大的那个不画出来
+                        brect_1 = calc_bounding_rect(debug_image,hand_results.multi_hand_landmarks[1])
+                        brect_history[0]=brect
+                        brect_history[1]=brect_1
+                        #print(brect_history)
+                        #print(brect_history) #计算brect_history 两矩阵的重叠面积是否超过60% 得到是否跳过的命令
+                        overlap_area=calc_overlap_rect_area(brect_history[0],brect_history[1])
+                        brect0_area=calc_rect_area(brect_history[0])
+                        brect1_area=calc_rect_area(brect_history[1])
+                        #print(overlap_area,brect0_area,brect1_area)
+                        #print(overlap_area/brect0_area,overlap_area/brect1_area)
+                        if (max(overlap_area/brect0_area,overlap_area/brect1_area)>=0.6):
+                            print("两手间存在一个识别错误的手 已将面积小的跳过显示")
+                            continue
+                    else:
+                        brect_history[0]=0
+                        brect_history[1]=0
+                    # 计算手的关键点
+                    landmark_list = calc_landmark_list(debug_image, hand_landmarks)
 
-                if work_mode==2:
-                    brect_size = (brect[2]-brect[0])*(brect[3]-brect[1])
-                    #print(brect_size/face_size)
-                    if(brect_size/face_size<0.1 or brect_size/face_size>4):
-                        print("存在一个识别面积不合理的手 已跳过显示")
-                        continue
+                    # 转换为相对坐标和规范化坐标
+                    pre_processed_landmark_list = pre_process_landmark(
+                        landmark_list)
+                    pre_processed_point_history_list = pre_process_point_history(
+                        debug_image, pointer_history)
+                    # 保存学习数据
+                    logging_csv(logNumber, logMode, pre_processed_landmark_list,
+                                pre_processed_point_history_list)
 
-                if(len(hand_results.multi_hand_landmarks)==2 and i==0): #预先计算出两个矩形的重叠面积占比 大的那个不画出来
-                    brect_1 = calc_bounding_rect(debug_image,hand_results.multi_hand_landmarks[1])
-                    brect_history[0]=brect
-                    brect_history[1]=brect_1
-                    #print(brect_history)
-                    #print(brect_history) #计算brect_history 两矩阵的重叠面积是否超过60% 得到是否跳过的命令
-                    overlap_area=calc_overlap_rect_area(brect_history[0],brect_history[1])
-                    brect0_area=calc_rect_area(brect_history[0])
-                    brect1_area=calc_rect_area(brect_history[1])
-                    #print(overlap_area,brect0_area,brect1_area)
-                    #print(overlap_area/brect0_area,overlap_area/brect1_area)
-                    if (max(overlap_area/brect0_area,overlap_area/brect1_area)>=0.6):
-                        print("两手间存在一个识别错误的手 已将面积小的跳过显示")
-                        continue
-                else:
-                    brect_history[0]=0
-                    brect_history[1]=0
-                # 计算手的关键点
-                landmark_list = calc_landmark_list(debug_image, hand_landmarks)
+                    # 手势分类
+                    hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
+                    hand_gesture_history.appendleft(hand_sign_id)
+                    
+                    if work_mode==0:
 
-                # 转换为相对坐标和规范化坐标
-                pre_processed_landmark_list = pre_process_landmark(
-                    landmark_list)
-                pre_processed_point_history_list = pre_process_point_history(
-                    debug_image, pointer_history)
-                # 保存学习数据
-                logging_csv(logNumber, logMode, pre_processed_landmark_list,
+                        if hand_sign_id == 0 and hand_gesture_history[1] == 0 and len(hand_results.multi_handedness)==2 : # 张开手掌的两只手手势
+                            #print(hand_gesture_history)
+                            if(handedness.classification[0].label[0:]=="Right"):
+                                LRF_point_history[1]=landmark_list[8]
+                            elif(handedness.classification[0].label[0:]=="Left"):
+                                LRF_point_history[0]=landmark_list[8] # 0存储左手位置 1存储右手位置
+                            
+                            if(LRF_point_history[1]!=[0,0] and LRF_point_history[0]!=[0,0]): #LRF=Left Right Finger
+                                LRF_line=int(calc_middle_line(LRF_point_history[0],LRF_point_history[1])/cap_width*500) # 将长度归一化
+                                if(LRF_line==0):
+                                    LRF_line=1
+                                debug_image=draw_mouse(debug_image,LRF_point_history[0],LRF_point_history[1])
+                                LRF_angle=calc_angle(LRF_point_history[0],LRF_point_history[1]) #计算得到LRFangle
+                                #print(LRFangle)
+
+                                if(firstLRFdata.leftF==None and max(LRF_point_history)!=inf_LRF_line):
+                                    firstLRFdata=firstLRF(LRF_point_history[0],LRF_point_history[1],LRF_line,LRF_angle)
+                                elif (max(LRF_point_history)!=inf_LRF_line): #判断不要快速跳动
+                                    func_op,func_param=func_switch_two_open(firstLRFdata,LRF_line,LRF_angle,zoom_time_history,spin_angle_history)
+                                    # print("func_op param",func_op,func_param)
+                                    func_res=func_result(func_op,func_param)
+                            
+                            append_other_deque(LRF_point_history,zoom_time_history,spin_angle_history,firstLRF_1=firstLRFdata)
+
+                        elif hand_sign_id == 0 and len(hand_results.multi_handedness)==1 : # 张开手掌的一只手手势
+                            hand_angle=calc_hand_angle(landmark_list[0],landmark_list[9])
+                            hand_angle_history.appendleft(hand_angle)
+                            func_slide(hand_angle_history)
+                            append_other_deque(hand_angle_history)
+                            
+                        elif hand_sign_id == 1:   # 如果是鼠标的手势
+                            middle_line=calc_middle_line(landmark_list[8],landmark_list[4]) #计算中间线长度
+                            hukou_line=calc_hukou_line(landmark_list[2],landmark_list[5]) #计算虎口长度
+
+                            middle_hukou_history.appendleft(middle_line/hukou_line)
+                            mouse_point_history.appendleft(landmark_list[12])
+                            append_other_deque(middle_hukou_history,mouse_point_history) #记录数据
+
+                            debug_image=draw_mouse(debug_image,landmark_list[8],landmark_list[4],mouse_point_history[0]) #画出中间线
+                            func_mouse(debug_image,mouse_point_history,middle_hukou_history)
+
+                        elif hand_sign_id == 2:   # 如果是抓住的手势
+                            middle_point=calc_middle_point(landmark_list[8],landmark_list[4]) #计算中间点
+                            middle_line=calc_middle_line(landmark_list[8],landmark_list[4]) #计算中间线长度
+                            hukou_line=calc_hukou_line(landmark_list[0],landmark_list[5]) #grab动作的虎口改为计算掌根到食指关节长度
+
+                            middle_hukou_history.appendleft(middle_line/hukou_line)
+                            mouse_point_history.appendleft(middle_point) #用两连线中点作为鼠标位置
+                            append_other_deque(middle_hukou_history,mouse_point_history) #记录数据
+
+                            debug_image=draw_mouse(debug_image,landmark_list[8],landmark_list[4],mouse_point_history[0]) #画出中间线
+                            func_grab(debug_image,mouse_point_history,middle_hukou_history)
+
+                        elif hand_sign_id == 4:  # 如果是伸出食指的手势
+                            pointer_history.append(landmark_list[8])  # 保存食指坐标
+                            append_other_deque(pointer_history)
+                            
+                            debug_image = draw_pointer(debug_image, pointer_history)
+
+                        elif hand_sign_id == 3: # ok手势
+                            nowNum = func_ok(hand_gesture_history)
+                            if (nowNum>20):
+                                nowNum=20
+                            debug_image = draw_progress(debug_image,brect,nowNum,20)
+
+                        elif hand_sign_id == 5: # two 手势
+                            nowNum=func_two(hand_gesture_history)
+                            if (nowNum>20):
+                                nowNum=20
+                            debug_image = draw_progress(debug_image,brect,nowNum,20)
+                            if(func_work_status_flag==7):
+                                if(hands_max_num==1):
+                                    hands_max_num=2
+                                elif(hands_max_num==2):
+                                    hands_max_num=1
+                                print("现在可识别最多手的数量为"+str(hands_max_num))
+                                hands = mp_hands.Hands(
+                                static_image_mode=use_static_image_mode,
+                                max_num_hands=hands_max_num,
+                                min_detection_confidence=min_detection_confidence,
+                                min_tracking_confidence=min_tracking_confidence,
+                            )
+
+                        elif hand_sign_id == 6:
+                            nowNum = func_three(hand_gesture_history)
+                            if (nowNum>20):
+                                nowNum=20
+                            debug_image = draw_progress(debug_image,brect,nowNum,20)
+                            if(func_work_status_flag==8):
+                                work_mode=10
+                                print("进入选择模式")
+                                func_string="Change Work Mode"
+                                break
+
+                        elif hand_sign_id == 7: #zero
+                            target_linear_vel   = 0.0
+                            control_linear_vel  = 0.0
+                            target_angular_vel  = 0.0
+                            control_angular_vel = 0.0
+                            print(vels(target_linear_vel, target_angular_vel))
+
+                        else:  
+                            append_other_deque()
+
+                        twist = Twist()
+
+                        control_linear_vel = makeSimpleProfile(control_linear_vel, target_linear_vel, (LIN_VEL_STEP_SIZE/2.0))
+                        twist.linear.x = control_linear_vel; twist.linear.y = 0.0; twist.linear.z = 0.0
+
+                        control_angular_vel = makeSimpleProfile(control_angular_vel, target_angular_vel, (ANG_VEL_STEP_SIZE/2.0))
+                        twist.angular.x = 0.0; twist.angular.y = 0.0; twist.angular.z = control_angular_vel
+
+                        pub.publish(twist)
+                    
+
+
+                    elif work_mode==10: #切换模式
+                        print("处于选择模式")
+                        if hand_sign_id == 7: #zero
+                            nowNum = func_zero(hand_gesture_history)
+                            if (nowNum>20):
+                                nowNum=20
+                            debug_image = draw_progress(debug_image,brect,nowNum,20)
+                            if(func_work_status_flag==9):
+                                work_mode=0
+                                print("进入普通模式")
+                                func_string="Change to Normal"
+
+                        
+                        elif hand_sign_id == 6:
+                            nowNum = func_three(hand_gesture_history)
+                            if (nowNum>20):
+                                nowNum=20
+                            debug_image = draw_progress(debug_image,brect,nowNum,20)
+                            if(func_work_status_flag==8):
+                                work_mode=10
+                                print("进入选择模式")
+                                func_string="Change Work Mode"
+                        
+                        else:
+                            append_other_deque()
+
+                    # 手指手势分类
+                    finger_gesture_id = 0
+                    point_history_len = len(pre_processed_point_history_list)
+                    if point_history_len == (16 * 2):
+                        finger_gesture_id = point_history_classifier(
                             pre_processed_point_history_list)
 
-                # 手势分类
-                hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
-                hand_gesture_history.appendleft(hand_sign_id)
-                
-                if work_mode==0:
+                    # 计算最近检测中最多的手势ID
+                    finger_gesture_history.append(finger_gesture_id)
+                    most_common_fg_id = Counter(
+                        finger_gesture_history).most_common()[0][0] # 根据历史的16个点的数据得到出现最多的手指手势作为置信手势
 
-                    if hand_sign_id == 0 and hand_gesture_history[1] == 0 and len(hand_results.multi_handedness)==2 : # 张开手掌的两只手手势
-                        #print(hand_gesture_history)
-                        if(handedness.classification[0].label[0:]=="Right"):
-                            LRF_point_history[1]=landmark_list[8]
-                        elif(handedness.classification[0].label[0:]=="Left"):
-                            LRF_point_history[0]=landmark_list[8] # 0存储左手位置 1存储右手位置
-                        
-                        if(LRF_point_history[1]!=[0,0] and LRF_point_history[0]!=[0,0]): #LRF=Left Right Finger
-                            LRF_line=int(calc_middle_line(LRF_point_history[0],LRF_point_history[1])/cap_width*500) # 将长度归一化
-                            if(LRF_line==0):
-                                LRF_line=1
-                            debug_image=draw_mouse(debug_image,LRF_point_history[0],LRF_point_history[1])
-                            LRF_angle=calc_angle(LRF_point_history[0],LRF_point_history[1]) #计算得到LRFangle
-                            #print(LRFangle)
+                    # 画出相关数据 fps/外接矩形/关键点/手势信息等
+                    debug_image = draw_bounding_rect(use_brect, debug_image, brect)
+                    debug_image = draw_landmarks(debug_image, landmark_list)
+                    debug_image = draw_info_text(
+                        debug_image,
+                        brect,
+                        handedness,
+                        keypoint_classifier_labels[hand_sign_id],
+                        point_history_classifier_labels[most_common_fg_id],
+                    )
+                debug_image = draw_image(debug_image)
+            else:
+                append_other_deque(hand_gesture_history)
+                debug_image = draw_image(debug_image)
+                pass
+            
+            # 保存最近的工作状态 判断最终输出结果
+            fwsf_history.appendleft(func_work_status_flag)
+            if(fwsf_history[1]==6 and fwsf_history[0]==0 and Counter(fwsf_history).most_common()[0][0]==6): #针对双手手势 修改func_string 以及进行输出
+                if("Zoom"  in func_res.func_op):
+                    func_res.func_param=np.median(zoom_time_history) #取中位数参数作为最终操作
+                    func_string=func_res.func_op+":"+str(abs(func_res.func_param))
+                elif("Clockwise" in func_res.func_op):
+                    func_res.func_param=np.median(spin_angle_history)
+                    func_string=func_res.func_op+":"+str(abs(func_res.func_param))
+                print("func_string "+func_string)
+                print("双手张开手势结束 输出结果")
 
-                            if(firstLRFdata.leftF==None and max(LRF_point_history)!=inf_LRF_line):
-                                firstLRFdata=firstLRF(LRF_point_history[0],LRF_point_history[1],LRF_line,LRF_angle)
-                            elif (max(LRF_point_history)!=inf_LRF_line): #判断不要快速跳动
-                                func_op,func_param=func_switch_two_open(firstLRFdata,LRF_line,LRF_angle,zoom_time_history,spin_angle_history)
-                                # print("func_op param",func_op,func_param)
-                                func_res=func_result(func_op,func_param)
-                        
-                        append_other_deque(LRF_point_history,zoom_time_history,spin_angle_history,firstLRF_1=firstLRFdata)
+            debug_image = draw_info(debug_image, func_string, func_work_status_flag, hands_max_num, logMode, logNumber)
 
-                    elif hand_sign_id == 0 and len(hand_results.multi_handedness)==1 : # 张开手掌的一只手手势
-                        hand_angle=calc_hand_angle(landmark_list[0],landmark_list[9])
-                        hand_angle_history.appendleft(hand_angle)
-                        func_slide(hand_angle_history)
-                        append_other_deque(hand_angle_history)
-                        
-                    elif hand_sign_id == 1:   # 如果是鼠标的手势
-                        middle_line=calc_middle_line(landmark_list[8],landmark_list[4]) #计算中间线长度
-                        hukou_line=calc_hukou_line(landmark_list[2],landmark_list[5]) #计算虎口长度
+            # 显示出来 #############################################################
+            cv.imshow('CleverHand', debug_image)
 
-                        middle_hukou_history.appendleft(middle_line/hukou_line)
-                        mouse_point_history.appendleft(landmark_list[12])
-                        append_other_deque(middle_hukou_history,mouse_point_history) #记录数据
+    except:
+        print(e)
 
-                        debug_image=draw_mouse(debug_image,landmark_list[8],landmark_list[4],mouse_point_history[0]) #画出中间线
-                        func_mouse(debug_image,mouse_point_history,middle_hukou_history)
-
-                    elif hand_sign_id == 2:   # 如果是抓住的手势
-                        middle_point=calc_middle_point(landmark_list[8],landmark_list[4]) #计算中间点
-                        middle_line=calc_middle_line(landmark_list[8],landmark_list[4]) #计算中间线长度
-                        hukou_line=calc_hukou_line(landmark_list[0],landmark_list[5]) #grab动作的虎口改为计算掌根到食指关节长度
-
-                        middle_hukou_history.appendleft(middle_line/hukou_line)
-                        mouse_point_history.appendleft(middle_point) #用两连线中点作为鼠标位置
-                        append_other_deque(middle_hukou_history,mouse_point_history) #记录数据
-
-                        debug_image=draw_mouse(debug_image,landmark_list[8],landmark_list[4],mouse_point_history[0]) #画出中间线
-                        func_grab(debug_image,mouse_point_history,middle_hukou_history)
-
-                    elif hand_sign_id == 4:  # 如果是伸出食指的手势
-                        pointer_history.append(landmark_list[8])  # 保存食指坐标
-                        append_other_deque(pointer_history)
-                        
-                        debug_image = draw_pointer(debug_image, pointer_history)
-
-                    elif hand_sign_id == 3: # ok手势
-                        nowNum = func_ok(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-
-                    elif hand_sign_id == 5: # two 手势
-                        nowNum=func_two(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if(func_work_status_flag==7):
-                            if(hands_max_num==1):
-                                hands_max_num=2
-                            elif(hands_max_num==2):
-                                hands_max_num=1
-                            print("现在可识别最多手的数量为"+str(hands_max_num))
-                            hands = mp_hands.Hands(
-                            static_image_mode=use_static_image_mode,
-                            max_num_hands=hands_max_num,
-                            min_detection_confidence=min_detection_confidence,
-                            min_tracking_confidence=min_tracking_confidence,
-                        )
-
-                    elif hand_sign_id == 6:
-                        nowNum = func_three(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if(func_work_status_flag==8):
-                            work_mode=10
-                            print("进入选择模式")
-                            func_string="Change Work Mode"
-                            break
-                    else:  
-                        append_other_deque()
-                
-                elif work_mode==1: #ppt模式
-                    #print("PPT")
-                    if hand_sign_id == 6:
-                        nowNum = func_three(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if(func_work_status_flag==8):
-                            work_mode=10
-                            print("进入选择模式")
-                            func_string="Change Work Mode"
-                            break
-
-                    elif hand_sign_id == 0 and hand_gesture_history[1] == 0 and len(hand_results.multi_handedness)==2 : # 缩放PPT
-                        #print(hand_gesture_history)
-                        if(handedness.classification[0].label[0:]=="Right"):
-                            LRF_point_history[1]=landmark_list[8]
-                        elif(handedness.classification[0].label[0:]=="Left"):
-                            LRF_point_history[0]=landmark_list[8] # 0存储左手位置 1存储右手位置
-                        
-                        if(LRF_point_history[1]!=[0,0] and LRF_point_history[0]!=[0,0]): #LRF=Left Right Finger
-                            LRF_line=int(calc_middle_line(LRF_point_history[0],LRF_point_history[1])/cap_width*500) # 将长度归一化
-                            if(LRF_line==0):
-                                LRF_line=1
-                            debug_image=draw_mouse(debug_image,LRF_point_history[0],LRF_point_history[1])
-                            LRF_angle=calc_angle(LRF_point_history[0],LRF_point_history[1]) #计算得到LRFangle
-                            #print(LRFangle)
-
-                            if(firstLRFdata.leftF==None and max(LRF_point_history)!=inf_LRF_line):
-                                firstLRFdata=firstLRF(LRF_point_history[0],LRF_point_history[1],LRF_line,LRF_angle)
-                            elif (max(LRF_point_history)!=inf_LRF_line): #判断不要快速跳动
-                                func_op,func_param=func_switch_two_open(firstLRFdata,LRF_line,LRF_angle,zoom_time_history,spin_angle_history)
-                                # print("func_op param",func_op,func_param)
-                                func_res=func_result(func_op,func_param)
-                        
-                        append_other_deque(LRF_point_history,zoom_time_history,spin_angle_history,firstLRF_1=firstLRFdata)
-
-                    elif hand_sign_id == 0 and len(hand_results.multi_handedness)==1 : # 上下切换PPT
-                        hand_angle=calc_hand_angle(landmark_list[0],landmark_list[9])
-                        hand_angle_history.appendleft(hand_angle)
-                        func_slide(hand_angle_history)
-                        append_other_deque(hand_angle_history)
-                        if (func_work_status_flag==3):
-                            if func_string=="Next One":
-                                keyboard.press(Key.right)
-                                keyboard.release(Key.right)
-                            elif func_string=="Last One":
-                                keyboard.press(Key.left)
-                                keyboard.release(Key.left)
-                        
-                    elif hand_sign_id == 1:   # 鼠标
-                        middle_line=calc_middle_line(landmark_list[8],landmark_list[4]) #计算中间线长度
-                        hukou_line=calc_hukou_line(landmark_list[2],landmark_list[5]) #计算虎口长度
-
-                        middle_hukou_history.appendleft(middle_line/hukou_line)
-                        mouse_point_history.appendleft(landmark_list[12])
-                        append_other_deque(middle_hukou_history,mouse_point_history) #记录数据
-
-                        debug_image=draw_mouse(debug_image,landmark_list[8],landmark_list[4],mouse_point_history[0]) #画出中间线
-                        func_mouse(debug_image,mouse_point_history,middle_hukou_history)
-
-                    elif hand_sign_id == 2:   # 抓取
-                        middle_point=calc_middle_point(landmark_list[8],landmark_list[4]) #计算中间点
-                        middle_line=calc_middle_line(landmark_list[8],landmark_list[4]) #计算中间线长度
-                        hukou_line=calc_hukou_line(landmark_list[0],landmark_list[5]) #grab动作的虎口改为计算掌根到食指关节长度
-
-                        middle_hukou_history.appendleft(middle_line/hukou_line)
-                        mouse_point_history.appendleft(middle_point) #用两连线中点作为鼠标位置
-                        append_other_deque(middle_hukou_history,mouse_point_history) #记录数据
-
-                        debug_image=draw_mouse(debug_image,landmark_list[8],landmark_list[4],mouse_point_history[0]) #画出中间线
-                        func_grab(debug_image,mouse_point_history,middle_hukou_history)
-
-                    elif hand_sign_id == 3: # 播放 播放PPT
-                        nowNum = func_ok(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if (func_work_status_flag==5):
-                            keyboard.press(Key.f5)
-                            keyboard.release(Key.f5)
-
-                    elif hand_sign_id == 7: #zero 结束播放PPT
-                        nowNum = func_zero(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if (func_work_status_flag==9):
-                            keyboard.press(Key.esc)
-                            keyboard.release(Key.esc)
-
-                    elif hand_sign_id == 4: # 播放 暂停视频（输出空格）
-                        nowNum = func_one(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if (func_work_status_flag==10):
-                            keyboard.press(Key.space)
-                            keyboard.release(Key.space)
-                            
-
-                elif work_mode==2: #2模式
-                    # print("two")
-                    if hand_sign_id == 6:
-                        nowNum = func_three(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if(func_work_status_flag==8):
-                            work_mode=10
-                            print("进入选择模式")
-                            func_string="Change Work Mode"
-                            break
-                   
-
-
-                elif work_mode==10: #切换模式
-                    print("处于选择模式")
-                    if hand_sign_id == 7: #zero
-                        nowNum = func_zero(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if(func_work_status_flag==9):
-                            work_mode=0
-                            print("进入普通模式")
-                            func_string="Change to Normal"
-
-                    elif hand_sign_id == 4:
-                        nowNum = func_one(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if(func_work_status_flag==10):
-                            work_mode=1
-                            print("进入PPT模式")
-                            func_string="Change to PPT"
-
-                    elif hand_sign_id == 5:
-                        nowNum = func_two(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if(func_work_status_flag==7):
-                            work_mode=2
-                            print("进入人脸识别模式")
-                            func_string="Change to Face Detections"
-                    
-                    elif hand_sign_id == 6:
-                        nowNum = func_three(hand_gesture_history)
-                        if (nowNum>20):
-                            nowNum=20
-                        debug_image = draw_progress(debug_image,brect,nowNum,20)
-                        if(func_work_status_flag==8):
-                            work_mode=10
-                            print("进入选择模式")
-                            func_string="Change Work Mode"
-                    
-                    else:
-                        append_other_deque()
-
-                # 手指手势分类
-                finger_gesture_id = 0
-                point_history_len = len(pre_processed_point_history_list)
-                if point_history_len == (16 * 2):
-                    finger_gesture_id = point_history_classifier(
-                        pre_processed_point_history_list)
-
-                # 计算最近检测中最多的手势ID
-                finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(
-                    finger_gesture_history).most_common()[0][0] # 根据历史的16个点的数据得到出现最多的手指手势作为置信手势
-
-                # 画出相关数据 fps/外接矩形/关键点/手势信息等
-                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
-                debug_image = draw_landmarks(debug_image, landmark_list)
-                debug_image = draw_info_text(
-                    debug_image,
-                    brect,
-                    handedness,
-                    keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id],
-                )
-            debug_image = draw_image(debug_image)
-        else:
-            append_other_deque(hand_gesture_history)
-            debug_image = draw_image(debug_image)
-            pass
-        
-        # 保存最近的工作状态 判断最终输出结果
-        fwsf_history.appendleft(func_work_status_flag)
-        if(fwsf_history[1]==6 and fwsf_history[0]==0 and Counter(fwsf_history).most_common()[0][0]==6): #针对双手手势 修改func_string 以及进行输出
-            if("Zoom"  in func_res.func_op):
-                func_res.func_param=np.median(zoom_time_history) #取中位数参数作为最终操作
-                func_string=func_res.func_op+":"+str(abs(func_res.func_param))
-            elif("Clockwise" in func_res.func_op):
-                func_res.func_param=np.median(spin_angle_history)
-                func_string=func_res.func_op+":"+str(abs(func_res.func_param))
-            print("func_string "+func_string)
-            print("双手张开手势结束 输出结果")
-            if work_mode==1: #ppt模式
-                if func_res.func_op=="Zoom on":
-                    keyboard.press('=')
-                    keyboard.release('=')
-                elif func_res.func_op=="Zoom out":
-                    keyboard.press('-')
-                    keyboard.release('-')
-
-        debug_image = draw_info(debug_image, func_string, func_work_status_flag, hands_max_num, logMode, logNumber)
-
-        # 显示出来 #############################################################
-        cv.imshow('CleverHand', debug_image)
+    finally:
+        pass
+        twist = Twist()
+        twist.linear.x = 0.0; twist.linear.y = 0.0; twist.linear.z = 0.0
+        twist.angular.x = 0.0; twist.angular.y = 0.0; twist.angular.z = 0.0
+        pub.publish(twist)
 
     cap.release()
     cv.destroyAllWindows()
@@ -1294,6 +1253,9 @@ def func_slide(hand_angle_history):
     args=get_args()
     global func_work_status_flag
     global func_string
+    global target_angular_vel
+    global target_linear_vel
+    
     big_angle=args.big_angle
     small_angle=args.small_angle
     pos_hand_angle_list=[]
@@ -1321,18 +1283,26 @@ def func_slide(hand_angle_history):
         print("下一张")
         func_work_status_flag=3
         func_string="Next One"
+        target_angular_vel = checkAngularLimitVelocity(target_angular_vel - ANG_VEL_STEP_SIZE) #向右
+        print(vels(target_linear_vel,target_angular_vel))
     elif hand_angle_history[0]>0 and hand_angle_history[-1]<0 and len(pos_hand_angle_list)==3 and len(neg_hand_angle_list)>=5 and hand_angle_history[0]-hand_angle_history[-1]>40:
         print("上一张")
         func_work_status_flag=3
         func_string="Last One"
+        target_angular_vel = checkAngularLimitVelocity(target_angular_vel + ANG_VEL_STEP_SIZE) #向左
+        print(vels(target_linear_vel,target_angular_vel))
     elif abs(hand_angle_history[0])<small_angle and abs(hand_angle_history[-1])>big_angle and len(small_hand_angle_list)==4 and len(big_hand_angle_list)>=4:
         print("向上")
         func_work_status_flag=4
         func_string="Up"
+        target_linear_vel = checkLinearLimitVelocity(target_linear_vel + LIN_VEL_STEP_SIZE) #前进
+        print(vels(target_linear_vel,target_angular_vel))
     elif abs(hand_angle_history[0])>big_angle and abs(hand_angle_history[-1])<small_angle and len(big_hand_angle_list)==4 and len(small_hand_angle_list)>=4:
         print("向下")
         func_work_status_flag=4
         func_string="Down"
+        target_linear_vel = checkLinearLimitVelocity(target_linear_vel - LIN_VEL_STEP_SIZE) #后退
+        print(vels(target_linear_vel,target_angular_vel))
     
 def func_ok(hand_gesture_history):
     # ok的手势 fwsf=5
