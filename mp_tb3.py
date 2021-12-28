@@ -11,7 +11,6 @@ import cv2 as cv
 import numpy as np
 import mediapipe as mp
 
-import wx
 
 from pynput.mouse import Button, Controller as mController
 from model import KeyPointClassifier
@@ -125,8 +124,7 @@ def get_args():
     parser.add_argument("--inf_LRF_line",type=int,default=999) #设定左右手的最大间距为999
     parser.add_argument('--inf_hand_angle',type=int,default=999) #设定没有检测到手时的角度为999
 
-    app=wx.App(False)
-    (sw,sh)=wx.GetDisplaySize()
+    (sw,sh)=(1920,1080)
 
     parser.add_argument("--swidth", help='screen width', type=int, default=sw)
     parser.add_argument("--sheight", help='screen height', type=int, default=sh)
